@@ -1,0 +1,91 @@
+name: Rollback
+
+# Manual or auto-triggered rollback.
+# Reverts the live service back to the previous BLUE deployment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to roll back'
+        type: choice
+        options: [staging, production]
+        default: production
+      reason:
+        description: 'Reason for rollback'
+        required: true
+        default: 'manual rollback'
+      to_revision:
+        description: 'Specific revision to roll back to (optional)'
+        required: false
+        default: ''
+  repository_dispatch:
+    types: [rollback]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cd-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  KUBE_NAMESPACE: wiki-${{ inputs.environment }}
+
+jobs:
+  rollback:
+    name: Rollback (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Identify previous deployment
+        id: prev
+        run: |
+          # The previous live deployment is annotated as wiki-blue
+          BLUE=$(kubectl -n ${{ env.KUBE_NAMESPACE }} get deploy wiki-blue -o name 2>/dev/null || true)
+          if [ -z "$BLUE" ]; then
+            echo "::error::No previous BLUE deployment found — nothing to roll back to"
+            exit 1
+          fi
+          # Scale up blue
+          kubectl -n ${{ env.KUBE_NAMESPACE }} scale deploy/wiki-blue --replicas=3
+          kubectl -n ${{ env.KUBE_NAMESPACE }} rollout status deployment/wiki-blue --timeout=180s
+
+      - name: Switch traffic back to BLUE
+        run: |
+          kubectl -n ${{ env.KUBE_NAMESPACE }} patch svc wiki -p '{"spec":{"selector":{"app.kubernetes.io/name":"wiki","app.kubernetes.io/slot":"blue"}}}'
+          sleep 3
+          kubectl -n ${{ env.KUBE_NAMESPACE }} port-forward svc/wiki 8082:3000 &
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8082/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Rollback verification failed: $STATUS"
+            exit 1
+          fi
+          echo "Rollback verified: live traffic serving from BLUE"
+
+      - name: Scale down failed GREEN
+        run: |
+          kubectl -n ${{ env.KUBE_NAMESPACE }} scale deploy/wiki-green --replicas=0 || true
+          echo "Failed GREEN scaled to 0"
+
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          bash scripts/notify.sh \
+            ":rewind: ROLLBACK completed on ${{ inputs.environment }}" \
+            "Reason: ${{ inputs.reason }}" \
+            "${{ github.sha }}" \
+            "#ff9900"

@@ -1,0 +1,24 @@
+# Live service — points to whichever slot is currently "live" (blue or green).
+# CD workflow patches .spec.selector to swap.
+#
+# Порт 80 выбран для соответствия схеме трафика:
+#   bastion:80 → ingressgateway:30001 (NodePort) → Gateway:80 → VirtualService → Service:80 → pod:3000
+#
+# targetPort: http (= 3000, containerPort wiki.js) — K8s делает port translation,
+# приложению менять ничего не нужно.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wiki
+  labels:
+    app.kubernetes.io/name: wiki
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: wiki
+    app.kubernetes.io/slot: blue   # default — patched by CD on promote
+  ports:
+    - name: http
+      port: 80           # exposed port (VirtualService routes сюда)
+      targetPort: http   # = 3000 (containerPort wiki.js)
+

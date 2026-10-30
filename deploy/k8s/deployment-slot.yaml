@@ -1,0 +1,115 @@
+# ════════════════════════════════════════════════════════════════════════
+# ⚠️  ЭТО ШАБЛОН, А НЕ ПРИМЕНЯЕМЫЙ МАНИФЕСТ.
+#
+# Содержит плейсхолдеры __IMAGE__ и __SLOT__, которые нужно заменить ПЕРЕД apply:
+#
+#   sed -e "s|__IMAGE__|ghcr.io/rollwar/wiki:v2.5.0|g" \
+#       -e "s|__SLOT__|blue|g" \
+#       deploy/k8s/deployment-slot.yaml > /tmp/wiki-blue.yaml
+#   kubectl -n <namespace> apply -f /tmp/wiki-blue.yaml
+#
+# Прямой `kubectl apply -f deployment-slot.yaml` ВАЛится с ошибкой:
+#   The Deployment "wiki-__SLOT__" is invalid: ...
+#
+# Используйте scripts/bootstrap.sh для первичной установки или
+# scripts/blue-green-deploy.sh для последующих релизов.
+# Pipeline (cd.yml) рендерит шаблон автоматически через sed.
+# ════════════════════════════════════════════════════════════════════════
+#
+# Slot-template Deployment. Two slots are kept:
+#   "blue"  — current live version (serves production traffic)
+#   "green" — next candidate version (smoke-tested before promote)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wiki-__SLOT__
+  labels:
+    app.kubernetes.io/name: wiki
+    app.kubernetes.io/slot: __SLOT__
+    app.kubernetes.io/managed-by: github-actions
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  # revisionHistoryLimit держит старые ReplicaSet'ы — нужно, чтобы
+  # `kubectl rollout undo` работал для ручного отката вне blue-green.
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wiki
+      app.kubernetes.io/slot: __SLOT__
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wiki
+        app.kubernetes.io/slot: __SLOT__
+      annotations:
+        # Явно ОТКЛЮЧАЕМ Istio sidecar injection.
+        # Istio Gateway (ingressgateway) всё ещё маршрутизирует внешний трафик,
+        # но pod'ы работают БЕЗ Envoy sidecar — это упрощает setup:
+        #   - не нужен NET_ADMIN/NET_RAW capability (PodSecurity = baseline OK)
+        #   - нет overhead на sidecar (CPU/RAM)
+        #   - проще дебаг (нет Envoy в логах)
+        # Минусы: нет mTLS между pod'ами (для staging/dev допустимо).
+        sidecar.istio.io/inject: "false"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      containers:
+        - name: wiki
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: wiki-config
+            - secretRef:
+                name: wiki-secret
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/data/uploads
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: [ALL]
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: wiki-uploads-pvc
+      # imagePullSecrets нужен, если GHCR-пакет приватный.
+      # Для публичного пакета можно удалить.
+      # imagePullSecrets:
+      #   - name: ghcr-pull-secret
+
+# PostgreSQL StatefulSet вынесен в отдельный файл deploy/k8s/postgres.yaml,
+# т.к. он не содержит плейсхолдеров и должен применяться только при bootstrap.
+

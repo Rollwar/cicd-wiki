@@ -1,0 +1,20 @@
+{
+  "theme": "default",
+  "themeVariables": {
+    "fontFamily": "Inter, 'Noto Sans SC', 'Helvetica Neue', Arial, sans-serif",
+    "fontSize": "14px",
+    "primaryColor": "#EFF6FF",
+    "primaryTextColor": "#0F172A",
+    "primaryBorderColor": "#3B82F6",
+    "lineColor": "#475569",
+    "secondaryColor": "#F1F5F9",
+    "tertiaryColor": "#FFFFFF"
+  },
+  "flowchart": {
+    "curve": "basis",
+    "nodeSpacing": 60,
+    "rankSpacing": 70,
+    "padding": 25,
+    "useMaxWidth": false
+  }
+}

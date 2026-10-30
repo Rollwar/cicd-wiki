@@ -1,0 +1,19 @@
+# Preview service — points to the GREEN slot for smoke testing before promote.
+# Тот же порт 80 → targetPort http (= 3000), что и у live service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wiki-preview
+  labels:
+    app.kubernetes.io/name: wiki
+    app.kubernetes.io/slot: green
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: wiki
+    app.kubernetes.io/slot: green
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+

@@ -1,0 +1,9 @@
+# Зависимости зависимостей, .gitignore, package-lock не коммитим и т.д.
+node_modules/
+*.log
+.DS_Store
+.env
+.env.*
+coverage/
+dist/
+.tmp/

@@ -1,0 +1,86 @@
+flowchart TB
+    classDef trigger fill:#EFF6FF,stroke:#3B82F6,stroke-width:2px,color:#1E3A8A
+    classDef ci fill:#F0FDF4,stroke:#10B981,stroke-width:2px,color:#064E3B
+    classDef cd fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350F
+    classDef test fill:#F5F3FF,stroke:#7C3AED,stroke-width:2px,color:#4C1D95
+    classDef monitor fill:#FFF1F2,stroke:#E11D48,stroke-width:2px,color:#881337
+    classDef notify fill:#F1F5F9,stroke:#475569,stroke-width:2px,color:#0F172A
+    classDef decision fill:#FFFFFF,stroke:#64748B,stroke-width:2px,color:#0F172A,stroke-dasharray: 5 5
+
+    %% ── Triggers ──
+    PUSH["🟢 git push / PR<br/>on feature, develop, main"]
+    MERGE["🔀 merge to main<br/>(release)"]
+    NIGHTLY["🌙 nightly cron<br/>04:00 / 05:00 UTC"]
+    MANUAL["🔧 manual dispatch<br/>(rollback / redeploy)"]
+
+    %% ── CI pipeline ──
+    subgraph CI["CI — Continuous Integration"]
+        direction TB
+        LINT["ESLint + Prettier<br/>+ TypeScript typecheck"]
+        SEC["Trivy fs scan<br/>+ npm audit (high+)"]
+        BUILD["Docker multi-stage build<br/>+ push to GHCR<br/>+ cosign sign"]
+        TAG["Tag: semver + sha + latest<br/>image digest captured"]
+        LINT --> SEC --> BUILD --> TAG
+    end
+
+    %% ── CD pipeline ──
+    subgraph CD["CD — Continuous Delivery (k3s, blue-green)"]
+        direction TB
+        DEPLOY_G["Deploy GREEN<br/>(preview slot, 3 replicas)"]
+        SMOKE["Smoke tests on GREEN<br/>/health, /api/pages"]
+        DECISION{"Smoke<br/>passed?"}
+        PROMOTE["Switch live service<br/>selector: blue → green"]
+        MONITOR["Post-deploy monitor<br/>2 min, 3-strike rule"]
+        SCALE_DOWN["Scale BLUE → 1 replica<br/>(kept for rollback)"]
+        AUTO_RB["Trigger auto-rollback<br/>workflow_dispatch"]
+        DEPLOY_G --> SMOKE --> DECISION
+        DECISION -->|yes| PROMOTE --> MONITOR --> SCALE_DOWN
+        DECISION -->|no| AUTO_RB
+        MONITOR -->|fail| AUTO_RB
+    end
+
+    %% ── Tests ──
+    subgraph TESTS["Functional & Performance"]
+        direction TB
+        E2E["E2E (8 scenarios)<br/>create, read, update, 404"]
+        K6["k6 load test<br/>ramping 0→50 VUs<br/>+ 5 writers constant"]
+        PERF_SLO{"p95 < 200ms<br/>err < 1%?"}
+        E2E --> K6 --> PERF_SLO
+    end
+
+    %% ── Rollback ──
+    subgraph RB["Rollback"]
+        RB_BLUE["Scale BLUE → 3<br/>+ rollout wait"]
+        RB_SWITCH["Switch service<br/>selector → blue"]
+        RB_GREEN["Scale GREEN → 0"]
+        RB_NOTIFY["Slack alert<br/>(orange)"]
+        RB_BLUE --> RB_SWITCH --> RB_GREEN --> RB_NOTIFY
+    end
+
+    %% ── Notifications ──
+    SLACK["📢 Slack webhook<br/>(per-stage status:<br/>success/fail/rollback)"]
+
+    %% ── Edges ──
+    PUSH --> LINT
+    MERGE --> LINT
+    TAG --> DEPLOY_G
+    SCALE_DOWN --> E2E
+    SCALE_DOWN --> K6
+    NIGHTLY --> E2E
+    NIGHTLY --> K6
+    MANUAL --> RB_BLUE
+    AUTO_RB --> RB_BLUE
+    LINT -.-> SLACK
+    BUILD -.-> SLACK
+    PROMOTE -.-> SLACK
+    PERF_SLO -.-> SLACK
+    RB_NOTIFY --> SLACK
+
+    class PUSH,MERGE,NIGHTLY,MANUAL trigger
+    class LINT,SEC,BUILD,TAG ci
+    class DEPLOY_G,SMOKE,PROMOTE,MONITOR,SCALE_DOWN cd
+    class DECISION,PERF_SLO decision
+    class AUTO_RB monitor
+    class E2E,K6 test
+    class RB_BLUE,RB_SWITCH,RB_GREEN,RB_NOTIFY monitor
+    class SLACK notify

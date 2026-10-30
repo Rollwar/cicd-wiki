@@ -1,0 +1,67 @@
+name: E2E
+
+# Functional end-to-end tests against a deployed environment.
+# Can be triggered manually, by CD after a deploy, or nightly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+  schedule:
+    - cron: '0 4 * * *'   # nightly at 04:00 UTC
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        default: staging
+
+permissions:
+  contents: read
+
+env:
+  KUBE_NAMESPACE: wiki-${{ inputs.environment }}
+
+jobs:
+  e2e:
+    name: Functional tests on ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Port-forward service
+        run: |
+          kubectl -n ${{ env.KUBE_NAMESPACE }} port-forward svc/wiki 8080:3000 &
+          echo $! > /tmp/pf.pid
+          sleep 5
+
+      - name: Run functional tests
+        env:
+          WIKI_URL: http://localhost:8080
+        run: bash tests/e2e/run.sh
+
+      - name: Tear down port-forward
+        if: always()
+        run: kill $(cat /tmp/pf.pid) 2>/dev/null || true
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report-${{ inputs.environment }}
+          path: tests/e2e/report/
+          retention-days: 14

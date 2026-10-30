@@ -1,0 +1,272 @@
+name: CD
+
+# Continuous Delivery pipeline for wiki-v2.
+# Triggered by CI after successful build, or manual.
+# Stages: deploy-blue (green) → smoke tests → switch traffic → cleanup → notify.
+# Blue-green deployment: zero downtime, automatic rollback on failure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g. sha-abc1234 or v2.5.0)'
+        required: true
+      image_digest:
+        description: 'Image SHA-256 digest (optional, recommended)'
+        required: false
+        default: ''
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+      source_sha:
+        description: 'Source commit SHA that triggered this deploy'
+        required: false
+        default: ''
+      source_run_id:
+        description: 'CI run id that triggered this deploy'
+        required: false
+        default: ''
+  repository_dispatch:
+    types: [deploy]
+
+permissions:
+  contents: read
+  id-token: write
+  packages: read
+
+concurrency:
+  group: cd-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  KUBE_NAMESPACE: wiki-${{ inputs.environment }}
+  IMAGE_NAME: ghcr.io/rollwar/wiki-v2
+
+jobs:
+  # ── Stage 1: deploy new version as "green" (preview) ────────────────────
+  deploy-green:
+    name: Deploy GREEN (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      green-deployment: ${{ steps.deploy-green.outputs.name }}
+      green-revision: ${{ steps.deploy-green.outputs.revision }}
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+
+      - name: Configure k3s kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: Ensure namespace + base manifests
+        run: |
+          kubectl apply -f deploy/k8s/namespace.yaml
+          kubectl -n ${{ env.KUBE_NAMESPACE }} apply -f deploy/k8s/configmap.yaml
+          kubectl -n ${{ env.KUBE_NAMESPACE }} apply -f deploy/k8s/pvc.yaml
+          kubectl -n ${{ env.KUBE_NAMESPACE }} apply -f deploy/k8s/secret.yaml
+          # Postgres StatefulSet + Service — без плейсхолдеров, применяется идемпотентно
+          kubectl -n ${{ env.KUBE_NAMESPACE }} apply -f deploy/k8s/postgres.yaml
+          # Live service + preview (без ingress — за него теперь отвечает Istio)
+          kubectl -n ${{ env.KUBE_NAMESPACE }} apply -f deploy/k8s/service.yaml
+          kubectl -n ${{ env.KUBE_NAMESPACE }} apply -f deploy/k8s/service-preview.yaml
+          # Istio Gateway + VirtualService + DestinationRule
+          # (манифест содержит metadata.namespace внутри, применяется без -n)
+          kubectl apply -f deploy/istio/wiki-${{ inputs.environment == 'production' && 'prod' || 'stage' }}.yaml
+
+      - name: Deploy GREEN (new version)
+        id: deploy-green
+        env:
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ inputs.image_digest && format('{0}', inputs.image_digest) || inputs.image_tag }}
+        run: |
+          # Render green manifest with the new image
+          sed -e "s|__IMAGE__|${IMAGE_REF}|g" \
+              -e "s|__SLOT__|green|g" \
+              deploy/k8s/deployment-slot.yaml > /tmp/deploy-green.yaml
+
+          kubectl -n ${{ env.KUBE_NAMESPACE }} apply -f /tmp/deploy-green.yaml --record=false
+          kubectl -n ${{ env.KUBE_NAMESPACE }} rollout status deployment/wiki-green --timeout=300s
+
+          NAME="wiki-green"
+          REV=$(kubectl -n ${{ env.KUBE_NAMESPACE }} get deployment $NAME -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')
+          echo "name=$NAME" >> $GITHUB_OUTPUT
+          echo "revision=$REV" >> $GITHUB_OUTPUT
+
+      - name: Notify — green deployed
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          bash scripts/notify.sh \
+            ":rocket: GREEN deployed to ${{ inputs.environment }}" \
+            "wiki-v2:${{ inputs.image_tag }}" \
+            "${{ github.sha }}" \
+            "#ff9900"
+
+  # ── Stage 2: smoke test on GREEN via preview service ──────────────────────
+  smoke-test:
+    name: Smoke tests on GREEN
+    needs: deploy-green
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Run smoke tests against preview service
+        env:
+          NAMESPACE: ${{ env.KUBE_NAMESPACE }}
+        run: bash scripts/smoke-test.sh
+
+      - name: Run functional E2E
+        env:
+          WIKI_URL: http://wiki-preview.${{ env.KUBE_NAMESPACE }}:3000
+        run: |
+          # Forwarded via port-forward inside a runner pod; here we curl via kubectl proxy
+          kubectl -n ${{ env.KUBE_NAMESPACE }} port-forward svc/wiki-preview 8080:3000 &
+          PF_PID=$!
+          sleep 5
+          export WIKI_URL=http://localhost:8080
+          bash tests/e2e/run.sh
+          kill $PF_PID
+
+  # ── Stage 3: switch traffic (BLUE → GREEN) ────────────────────────────────
+  switch-traffic:
+    name: Promote GREEN to live
+    needs: smoke-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Switch service selector to slot=green
+        run: |
+          kubectl -n ${{ env.KUBE_NAMESPACE }} patch svc wiki -p '{"spec":{"selector":{"app.kubernetes.io/name":"wiki","app.kubernetes.io/slot":"green"}}}'
+          # Wait for endpoints to refresh
+          sleep 3
+          kubectl -n ${{ env.KUBE_NAMESPACE }} get endpoints wiki -o yaml
+
+      - name: Verify live traffic
+        run: |
+          kubectl -n ${{ env.KUBE_NAMESPACE }} port-forward svc/wiki 8081:3000 &
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/health)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Live health check failed: $STATUS"
+            exit 1
+          fi
+          echo "Live traffic verified: 200 OK"
+
+      - name: Notify — promoted
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          bash scripts/notify.sh \
+            ":tada: Promoted to ${{ inputs.environment }}" \
+            "wiki-v2:${{ inputs.image_tag }}" \
+            "${{ github.sha }}" \
+            "#36a64f"
+
+  # ── Stage 4: scale down old BLUE (keep for rollback) ─────────────────────
+  scale-down-blue:
+    name: Scale down BLUE
+    needs: switch-traffic
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Annotate previous blue revision (for rollback)
+        run: |
+          # Find existing blue deployment (the previous live slot)
+          BLUE=$(kubectl -n ${{ env.KUBE_NAMESPACE }} get deploy -l app.kubernetes.io/slot=blue -o name || true)
+          if [ -n "$BLUE" ]; then
+            kubectl -n ${{ env.KUBE_NAMESPACE }} annotate --overwrite deploy/wiki-blue \
+              wiki.rollwar.io/last-live-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              wiki.rollwar.io/image-tag="${{ inputs.image_tag }}"
+            # Keep 1 replica warm for fast rollback — scale down but don't delete
+            kubectl -n ${{ env.KUBE_NAMESPACE }} scale deploy/wiki-blue --replicas=1
+            echo "BLUE scaled to 1 (kept for rollback)"
+          else
+            echo "No prior BLUE — fresh deploy"
+          fi
+
+      - name: Tag current green as blue (for next cycle)
+        run: |
+          # Rename: the new green becomes the new blue on the next deploy
+          # We achieve this by patching labels via a state annotation
+          kubectl -n ${{ env.KUBE_NAMESPACE }} annotate --overwrite deploy/wiki-green \
+            wiki.rollwar.io/promoted-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # ── Stage 5: post-deploy health monitor (auto-rollback) ──────────────────
+  post-deploy-monitor:
+    name: Post-deploy monitor (auto-rollback on failure)
+    needs: [switch-traffic, scale-down-blue]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Monitor health for 2 minutes — auto-rollback if degraded
+        env:
+          NAMESPACE: ${{ env.KUBE_NAMESPACE }}
+          ROLLBACK_WORKFLOW: rollback.yml
+        run: bash scripts/post-deploy-monitor.sh
+
+  # ── Final: notify ─────────────────────────────────────────────────────────
+  notify-failure:
+    name: Notify failure (auto-rollback triggered)
+    needs: [deploy-green, smoke-test, switch-traffic, post-deploy-monitor]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          bash scripts/notify.sh \
+            ":rotating_light: CD FAILED — rollback triggered" \
+            "wiki-v2:${{ inputs.image_tag }}" \
+            "${{ github.sha }}" \
+            "#dc3545"

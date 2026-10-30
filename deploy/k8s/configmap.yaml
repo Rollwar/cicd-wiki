@@ -1,0 +1,37 @@
+# Конфигурация wiki.js.
+#
+# Список переменных, которые реально читает requarks/wiki-v2 (см. server/models/db.js
+# в upstream-репозитории). Полный список env vars wiki.js v2:
+#   https://docs.requarks.io/install/env
+#
+# ВАЖНО: DB_HOST намеренно использует короткое имя "postgres" (без namespace).
+# В Kubernetes это резолвится в postgres.<текущий-namespace>.svc.cluster.local,
+# поэтому один и тот же ConfigMap работает и в wiki-staging, и в wiki-production.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wiki-config
+  labels:
+    app.kubernetes.io/name: wiki
+data:
+  # ── Режим запуска ──────────────────────────────────────────────────────
+  NODE_ENV: production
+  LOG_LEVEL: info
+
+  # ── Тип БД (обязательно — без него wiki.js падает с "Invalid DB Type") ──
+  DB_TYPE: postgres
+
+  # ── Подключение к PostgreSQL (короткое имя резолвится в текущем namespace) ──
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: wiki
+  DB_USER: wiki
+
+  # ── Опционально — если требуется SSL к БД (для managed PostgreSQL) ─────
+  DB_SSL: "false"
+
+  # ── URL для приложения (граф фронтенда) ─────────────────────────────────
+  # Если ingress использует TLS, заменить на https://...
+  # Установите, если wiki.js будет отдавать корректные ссылки в UI/emails.
+  # Note: реальный домен должен совпадать с Ingress / Istio Gateway host.
+

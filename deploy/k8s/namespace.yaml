@@ -1,0 +1,30 @@
+# Неймспейсы для wiki.js (staging + production).
+#
+# PodSecurity: используем "baseline" — это безопасно, потому что wiki pod'ы
+# работают БЕЗ Istio sidecar (аннотация sidecar.istio.io/inject: "false"
+# в deployment-slot.yaml). Sidecar требовал бы NET_ADMIN/NET_RAW capabilities,
+# которые baseline запрещает. Без sidecar baseline работает нормально.
+#
+# Istio Gateway (ingressgateway) живёт в namespace istio-system со своими
+# правилами — на wiki-staging это не влияет.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wiki-staging
+  labels:
+    app.kubernetes.io/part-of: wiki
+    # istio-injection=enabled оставлено для совместимости, но wiki pods НЕ получают
+    # sidecar из-за аннотации sidecar.istio.io/inject: "false" в Deployment.
+    # Другие deployments в этом namespace будут получать sidecar (если появятся).
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wiki-production
+  labels:
+    app.kubernetes.io/part-of: wiki
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: baseline
+

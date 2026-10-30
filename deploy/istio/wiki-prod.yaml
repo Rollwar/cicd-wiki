@@ -1,0 +1,76 @@
+# Istio манифесты для Wiki.js — PRODUCTION
+# Хост: wiki.k8s-3.sa → service wiki в namespace wiki-production, порт 3000
+# Используем k8s-3.sa, т.к. кластер (контекст k8s) находится на узле 192.168.208.3.
+# Bastion nginx маршрутизирует *.k8s-3.sa → 192.168.208.3:30001 (istio-ingressgateway NodePort).
+# Дополнительно: DestinationRule (load balancer + outlier detection) для blue-green.
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: wiki
+  namespace: wiki-production
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - wiki.k8s-3.sa
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: wiki
+  namespace: wiki-production
+spec:
+  hosts:
+    - wiki.k8s-3.sa
+  gateways:
+    - wiki
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: wiki.wiki-production.svc.cluster.local
+            port:
+              number: 80
+      # Production hardening
+      retries:
+        attempts: 3
+        perTryTimeout: 5s
+        retryOn: "5xx,reset,connect-failure,refused-stream"
+      timeout: 30s
+      headers:
+        response:
+          set:
+            X-Frame-Options: DENY
+            X-Content-Type-Options: nosniff
+            Strict-Transport-Security: "max-age=31536000; includeSubDomains"
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: wiki
+  namespace: wiki-production
+spec:
+  host: wiki.wiki-production.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      simple: LEAST_REQUEST
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 100
+        maxRequestsPerConnection: 10
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 60s
+      maxEjectionPercent: 50

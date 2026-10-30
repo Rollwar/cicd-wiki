@@ -1,0 +1,61 @@
+# Istio манифесты для Wiki.js — STAGE
+# Хост: wiki-stage.k8s-3.sa → service wiki в namespace wiki-staging, порт 3000
+# Используем k8s-3.sa, т.к. кластер (контекст k8s) находится на узле 192.168.208.3.
+# Bastion nginx маршрутизирует *.k8s-3.sa → 192.168.208.3:30001 (istio-ingressgateway NodePort).
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: wiki
+  namespace: wiki-staging
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - wiki-stage.k8s-3.sa
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: wiki
+  namespace: wiki-staging
+spec:
+  hosts:
+    - wiki-stage.k8s-3.sa
+  gateways:
+    - wiki
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: wiki.wiki-staging.svc.cluster.local
+            port:
+              number: 80
+      retries:
+        attempts: 2
+        perTryTimeout: 5s
+        retryOn: "5xx,reset,connect-failure,refused-stream"
+      timeout: 15s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: wiki
+  namespace: wiki-staging
+spec:
+  host: wiki.wiki-staging.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      simple: LEAST_REQUEST
+    outlierDetection:
+      consecutive5xxErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50

@@ -1,0 +1,29 @@
+flowchart LR
+    classDef branch fill:#F1F5F9,stroke:#475569,stroke-width:2px,color:#0F172A
+    classDef stable fill:#EFF6FF,stroke:#3B82F6,stroke-width:2px,color:#1E3A8A
+    classDef release fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#78350F
+    classDef hotfix fill:#FFF1F2,stroke:#E11D48,stroke-width:2px,color:#881337
+
+    MAIN(["main<br/>(production)"])
+    DEVELOP(["develop<br/>(staging)"])
+
+    FEATURE1["feature/add-graph"]
+    FEATURE2["feature/fix-auth"]
+    FEATURE3["feature/upload-s3"]
+
+    REL["release/v2.5.1<br/>(RC prep)"]
+    HOTFIX["hotfix/critical-cve"]
+
+    FEATURE1 --> DEVELOP
+    FEATURE2 --> DEVELOP
+    FEATURE3 --> DEVELOP
+    DEVELOP --> MAIN
+    REL --> MAIN
+    HOTFIX --> MAIN
+    HOTFIX -.-> DEVELOP
+
+    class MAIN stable
+    class DEVELOP stable
+    class FEATURE1,FEATURE2,FEATURE3 branch
+    class REL release
+    class HOTFIX hotfix
