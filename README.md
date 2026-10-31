@@ -2,7 +2,7 @@
 
 > Полноценный конвейер Continuous Integration / Continuous Delivery для приложения
 > [Wiki.js v2](https://github.com/Rollwar/wiki-v2), построенный на **GitHub Actions** и
-> ориентированный на развёртывание в **k3s** (легковесный Kubernetes) по стратегии
+> ориентированный на развёртывание в **k8s** по стратегии
 > **blue-green** (бесшовный deploy с мгновенным откатом).
 
 ![Pipeline diagram](diagrams/pipeline.png)
@@ -220,16 +220,11 @@ Service `wiki` указывает на активный slot (`selector: slot=bl
 - Тесты: [`tests/e2e/run.sh`](tests/e2e/run.sh) (bash) и [`tests/e2e/e2e.test.js`](tests/e2e/e2e.test.js) (Node-обёртка)
 - Триггеры: ручной запуск, nightly (04:00 UTC), после CD.
 
-8 сценариев:
+2 сценария:
 
-1. `GET /` возвращает Wiki.js с версией
-2. `GET /health/live` → 200 (liveness)
-3. `GET /health/ready` → 200 (readiness, БД доступна)
-4. `POST /api/pages` создаёт новую страницу (201)
-5. `GET /api/pages/<slug>` возвращает корректный заголовок
-6. `POST /api/pages` (апдейт) — idempotent, сохраняет id, обновляет контент
-7. `GET /api/pages` возвращает ≥1 записи
-8. `GET /api/pages/<несуществующий>` → 404
+1. `GET /health/live` → 200 (liveness)
+2. `GET /health/ready` → 200 (readiness, БД доступна)
+
 
 ### Performance (k6)
 
@@ -344,12 +339,9 @@ python3 demo/dry-run.py
 [0004.25s]  ✓   k6 load test (20 VUs / 3s) (3.01s) — reqs=10287  avg=5.8ms  p95=26.8ms  err=0.00%  -> SLO PASS
 ```
 
-### Реальный запуск на k3s
+### Реальный запуск на k8s
 
 ```bash
-# 0. Установить k3s (одна нода, локально)
-curl -sfL https://get.k3s.io | sh -
-
 # 1. Применить неймспейсы (создают wiki-staging + wiki-production)
 sudo kubectl apply -f deploy/k8s/namespace.yaml
 
@@ -458,28 +450,6 @@ cicd-wikijs/
 | Имя                  | Назначение                                         | Пример                                       |
 |----------------------|----------------------------------------------------|----------------------------------------------|
 | `SLACK_WEBHOOK_URL`  | Slack incoming webhook для уведомлений             | `https://hooks.slack.com/services/...`       |
-| `K3S_KUBECONFIG`     | base64 kubeconfig для подключения к k3s кластеру   | `base64 -w0 ~/.kube/config`                  |
 | `CICD_PAT`           | GitHub PAT для cross-repo `workflow_dispatch`      | `ghp_...` (repo:workflow scope)              |
 
-`GITHUB_TOKEN` автоматически предоставляется GitHub Actions — используется для пуша в GHCR (packages: write).
 
----
-
-## Расширение и доработка
-
-Идеи для развития:
-
-- **Подпись образов через cosign + policy controller** в кластере (Gatekeeper / Kyverno).
-- **Sealed Secrets** или **external-secrets-operator** вместо plaintext Secret в манифесте.
-- **Helm chart** вместо raw YAML (упростит multitenancy).
-- **Prometheus + Grafana** + ServiceMonitor для сбора метрик wiki.js в реальном времени.
-- **Trivy image scan** после build-стейджа (block deploy при CRITICAL).
-- **Canary deployment** через Argo Rollouts / Flagger как следующая ступень после blue-green.
-- **Multi-arch образы** (amd64 + arm64) через `docker/build-push-action` platforms.
-
----
-
-## Лицензия и авторство
-
-Демонстрационный проект. Wiki.js © Requarks и соавторы, используется по лицензии AGPL-3.0.
-CI/CD код в этом репозитории — MIT.
