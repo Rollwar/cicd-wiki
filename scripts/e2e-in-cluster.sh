@@ -1,7 +1,27 @@
 #!/usr/bin/env bash
 # scripts/e2e-in-cluster.sh — запускает E2E тесты ИЗНУТРИ кластера,
 # через временный debug-pod с curl+jq.
-
+#
+# Зачем:
+#   - port-forward создаёт localhost:8080 только на runner'е.
+#     Из других мест (включая браузер и другие поды) он недоступен.
+#   - Временный pod внутри namespace видит все Service'ы по их DNS-имени
+#     (wiki-preview.wiki-staging.svc.cluster.local), что ближе к реальному
+#     сетевому пути приложений в кластере.
+#
+# Логика:
+#   1. Создаём临时ный pod с образом curlimages/curl + jq
+#   2. Копируем в него tests/e2e/run.sh
+#   3. Запускаем тесты с WIKI_URL=cluster-dns-имя
+#   4. Получаем результаты через stdout
+#   5. Pod автоматически удаляется (--rm)
+#
+# Usage:
+#   bash scripts/e2e-in-cluster.sh <namespace> <service-name> [report-dir]
+#
+# Examples:
+#   bash scripts/e2e-in-cluster.sh wiki-staging wiki-preview
+#   bash scripts/ecte-in-cluster.sh wiki-staging wiki        # для post-promote (live service)
 set -euo pipefail
 
 NAMESPACE="${1:?usage: e2e-in-cluster.sh <namespace> <service-name> [report-dir]}"
@@ -23,7 +43,11 @@ echo "[e2e-in-cluster] pod=$POD_NAME"
 IMAGE="alpine:3.20"
 
 # 1. Создать pod с alpine, установить curl и jq
-echo "[e2e-in-cluster] creating debug pod $POD_NAME ..."
+# ВАЖНО: аннотация sidecar.istio.io/inject=false — отключает Istio sidecar injection
+# для этого временного pod'а. Без неё в namespace с istio-injection=enabled
+# к pod'у добавляется istio-init container, требующий NET_ADMIN/NET_RAW capabilities,
+# что запрещено PodSecurity baseline.
+echo "[e2e-in-cluster] creating debug pod $POD_NAME (istio sidecar disabled)..."
 kubectl --context k8s -n "$NAMESPACE" run "$POD_NAME" \
   --image="$IMAGE" \
   --restart=Never \
@@ -34,6 +58,9 @@ kubectl --context k8s -n "$NAMESPACE" run "$POD_NAME" \
       "labels": {
         "app.kubernetes.io/name": "e2e-test",
         "app.kubernetes.io/managed-by": "ci-pipeline"
+      },
+      "annotations": {
+        "sidecar.istio.io/inject": "false"
       }
     }
   }'
