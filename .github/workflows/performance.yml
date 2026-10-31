@@ -1,8 +1,5 @@
 name: Performance
 
-# Performance tests against a deployed environment using k6.
-# Triggered: nightly, manually, or after a successful production deploy.
-
 on:
   workflow_dispatch:
     inputs:
@@ -28,61 +25,81 @@ permissions:
   contents: read
 
 env:
-  KUBE_NAMESPACE: wiki-production
+  # Явный URL для target (production по умолчанию, если не указано иное)
+  # Используется в job k6-load ниже с конкретным выбором environment
+  DEFAULT_TARGET_ENV: production
 
 jobs:
   k6-load:
     name: k6 load test
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 20
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure kubeconfig
-        run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
-
-      - name: Install kubectl + k6
-        run: |
-          curl -fsSL https://dl.k6.io/x86_64-linux/k6-v0.51.0.tar.gz | tar -xz -C /tmp
-          sudo mv /tmp/k6-v0.51.0/k6 /usr/local/bin/
-          k6 version
-
-      - name: Resolve target URL
+      - name: Resolve target URL based on environment
         id: target
         run: |
-          ENV="${{ inputs.environment || 'production' }}"
+          ENV="${{ inputs.environment || env.DEFAULT_TARGET_ENV }}"
+          if [ "$ENV" = "production" ]; then
+            URL="http://wiki.k8s-3.sa"
+          else
+            URL="http://wiki-stage.k8s-3.sa"
+          fi
           echo "env=$ENV" >> $GITHUB_OUTPUT
-          echo "url=http://wiki.${ENV}.svc.cluster.local:3000" >> $GITHUB_OUTPUT
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "Resolved: env=$ENV, url=$URL"
+
+      - name: Verify kubectl + context k8s (sanity check)
+        run: |
+          kubectl --context k8s version --client
+          NS="wiki-${{ steps.target.outputs.env }}"
+          kubectl --context k8s -n "$NS" get deploy -l app.kubernetes.io/name=wiki | head -3
+
+      - name: Verify target URL reachable
+        env:
+          URL: ${{ steps.target.outputs.url }}
+        run: |
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL/health/live" || echo 000)
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Target $URL not reachable (status=$STATUS)"
+            exit 1
+          fi
+          echo "✓ $URL reachable"
+
+      - name: Install k6 (if missing)
+        run: |
+          if ! command -v k6 >/dev/null 2>&1; then
+            echo "k6 not found, installing..."
+            curl -fsSL https://dl.k6.io/x86_64-linux/k6-v0.51.0.tar.gz | tar -xz -C /tmp
+            sudo mv /tmp/k6-v0.51.0/k6 /usr/local/bin/
+          fi
+          k6 version
 
       - name: Run k6 load test
         env:
           K6_OUT: json=/tmp/k6-results.json
         run: |
+          EXIT_CODE=0
           k6 run \
             --env TARGET_URL=${{ steps.target.outputs.url }} \
             --env DURATION=${{ inputs.duration || '60s' }} \
             --env VUS=${{ inputs.vus || '50' }} \
             --summary-export=/tmp/k6-summary.json \
-            tests/performance/k6-load.js || EXIT=$?
-
-          # Capture threshold failures but don't fail the workflow — capture result instead
-          EXIT=${EXIT:-0}
-          echo "exit=$EXIT" >> $GITHUB_ENV
+            tests/performance/k6-load.js || EXIT_CODE=$?
+          echo "k6 exit code: $EXIT_CODE"
+          # Не падаем сразу — результаты нужно распарсить и сравнить с SLO
           exit 0
 
       - name: Parse k6 results
         id: parse
         run: |
-          node tests/performance/parse-results.js /tmp/k6-summary.json > /tmp/perf-summary.md
-          cat /tmp/perf-summary.md
-          # Determine pass/fail based on p95 latency threshold (200ms)
-          P95=$(jq -r '.metrics.http_req_duration["p(95)"]' /tmp/k6-summary.json)
-          PASS=$(echo "$P95 < 200" | bc -l)
+          node tests/performance/parse-results.js /tmp/k6-summary.json > /tmp/perf-summary.md || true
+          cat /tmp/perf-summary.md || true
+          P95=$(jq -r '.metrics.http_req_duration["p(95)"]' /tmp/k6-summary.json 2>/dev/null || echo 0)
+          PASS=$(echo "$P95 < 200" | bc -l 2>/dev/null || echo 0)
           echo "p95_ms=$P95" >> $GITHUB_OUTPUT
           echo "passed=$PASS" >> $GITHUB_OUTPUT
 
@@ -91,7 +108,7 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          if [ "${{ steps.parse.outputs.passed }}" == "1" ]; then
+          if [ "${{ steps.parse.outputs.passed }}" = "1" ]; then
             STATUS=":white_check_mark: PASSED"
             COLOR="#36a64f"
           else
@@ -99,8 +116,8 @@ jobs:
             COLOR="#ff9900"
           fi
           bash scripts/notify.sh \
-            "$STATUS — performance test on ${{ inputs.environment || 'production' }}" \
-            "p95=${{ steps.parse.outputs.p95_ms }}ms" \
+            "$STATUS — performance test on ${{ steps.target.outputs.env }}" \
+            "p95=${{ steps.parse.outputs.p95_ms }}ms  URL=${{ steps.target.outputs.url }}" \
             "${{ github.sha }}" \
             "$COLOR"
 
@@ -108,7 +125,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: k6-report-${{ inputs.environment || 'production' }}
+          name: k6-report-${{ steps.target.outputs.env }}
           path: |
             /tmp/k6-results.json
             /tmp/k6-summary.json

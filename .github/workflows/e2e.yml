@@ -1,7 +1,8 @@
 name: E2E
 
 # Functional end-to-end tests against a deployed environment.
-# Can be triggered manually, by CD after a deploy, or nightly.
+# Запускается на self-hosted runner, где kubectl context=k8s уже настроен.
+# Тесты идут через явный URL (bastion → ingressgateway → wiki service).
 
 on:
   workflow_dispatch:
@@ -24,39 +25,44 @@ permissions:
 
 env:
   KUBE_NAMESPACE: wiki-${{ inputs.environment }}
+  # Явный URL (bastion → ingressgateway → wiki service)
+  WIKI_URL: ${{ inputs.environment == 'production' && 'http://wiki.k8s-3.sa' || 'http://wiki-stage.k8s-3.sa' }}
 
 jobs:
   e2e:
     name: Functional tests on ${{ inputs.environment }}
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure kubeconfig
+      - name: Verify kubectl + context k8s
         run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.K3S_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
+          kubectl --context k8s version --client
+          kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} get deploy -l app.kubernetes.io/name=wiki | head -5
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: Port-forward service
-        run: |
-          kubectl -n ${{ env.KUBE_NAMESPACE }} port-forward svc/wiki 8080:3000 &
-          echo $! > /tmp/pf.pid
-          sleep 5
-
-      - name: Run functional tests
+      - name: Verify WIKI_URL is reachable
         env:
-          WIKI_URL: http://localhost:8080
-        run: bash tests/e2e/run.sh
+          URL: ${{ env.WIKI_URL }}
+        run: |
+          echo "Testing URL: $URL"
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$URL/health/live" || echo 000)
+            if [ "$STATUS" = "200" ]; then
+              echo "✓ $URL reachable (HTTP 200)"
+              exit 0
+            fi
+            echo "Attempt $i: status=$STATUS, retrying in 5s..."
+            sleep 5
+          done
+          echo "::error::$URL not reachable after 10 attempts"
+          exit 1
 
-      - name: Tear down port-forward
-        if: always()
-        run: kill $(cat /tmp/pf.pid) 2>/dev/null || true
+      - name: Run functional tests via explicit URL
+        env:
+          WIKI_URL: ${{ env.WIKI_URL }}
+        run: bash tests/e2e/run.sh
 
       - name: Upload test report
         if: always()

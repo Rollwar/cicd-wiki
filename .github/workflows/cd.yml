@@ -1,10 +1,5 @@
 name: CD
 
-# Continuous Delivery pipeline for wiki-v2.
-# Triggered by CI after successful build, or manual.
-# Stages: deploy-blue (green) → smoke tests → switch traffic → cleanup → notify.
-# Blue-green deployment: zero downtime, automatic rollback on failure.
-
 on:
   workflow_dispatch:
     inputs:
@@ -42,13 +37,15 @@ concurrency:
 
 env:
   KUBE_NAMESPACE: wiki-${{ inputs.environment }}
-  IMAGE_NAME: ghcr.io/rollwar/wiki-v2
+  IMAGE_NAME: ghcr.io/rollwar/wiki
+  # Явные URL для проверок (bastion → ingressgateway → wiki service)
+  WIKI_URL: ${{ inputs.environment == 'production' && 'http://wiki.k8s-3.sa' || 'http://wiki-stage.k8s-3.sa' }}
 
 jobs:
-  # ── Stage 1: deploy new version as "green" (preview) ────────────────────
+  # ── Stage 1: deploy new version as GREEN ────────────────────────────────
   deploy-green:
     name: Deploy GREEN (${{ inputs.environment }})
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 15
     outputs:
       green-deployment: ${{ steps.deploy-green.outputs.name }}
@@ -56,6 +53,15 @@ jobs:
     steps:
       - name: Checkout pipeline repo
         uses: actions/checkout@v4
+
+      - name: Verify kubectl + context k8s
+        run: |
+          kubectl --context k8s version --client
+          kubectl --context k8s cluster-info
+          kubectl --context k8s get ns ${{ env.KUBE_NAMESPACE }} || {
+            echo "::error::Namespace ${{ env.KUBE_NAMESPACE }} not found on context k8s"
+            exit 1
+          }
 
       - name: Ensure namespace + base manifests
         run: |
@@ -94,42 +100,45 @@ jobs:
         run: |
           bash scripts/notify.sh \
             ":rocket: GREEN deployed to ${{ inputs.environment }}" \
-            "wiki-v2:${{ inputs.image_tag }}" \
+            "wiki:${{ inputs.image_tag }}" \
             "${{ github.sha }}" \
             "#ff9900"
 
-  # ── Stage 2: smoke test on GREEN via preview service ──────────────────────
+  # ── Stage 2: smoke test on GREEN via preview URL ──────────────────────────
   smoke-test:
     name: Smoke tests on GREEN
     needs: deploy-green
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run smoke tests against preview service
+      - name: Run smoke tests via preview service (port-forward 8080:80)
         env:
           NAMESPACE: ${{ env.KUBE_NAMESPACE }}
-        run: bash scripts/smoke-test.sh
-
-      - name: Run functional E2E
-        env:
-          WIKI_URL: http://wiki-preview.${{ env.KUBE_NAMESPACE }}:3000
         run: |
-          # Forwarded via port-forward inside a runner pod; here we curl via kubectl --context k8s proxy
-          kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} port-forward svc/wiki-preview 8080:3000 &
-          PF_PID=$!
-          sleep 5
-          export WIKI_URL=http://localhost:8080
-          bash tests/e2e/run.sh
-          kill $PF_PID
+          # GREEN slot доступен через svc/wiki-preview в namespace.
+          # Port-forward с runner'а (kubectl context k8s уже настроен).
+          kubectl --context k8s -n "$NAMESPACE" port-forward svc/wiki-preview 8080:80 >/tmp/smoke-pf.log 2>&1 &
+          PF=$!
+          trap "kill $PF 2>/dev/null || true" EXIT
+          for i in {1..15}; do
+            curl -sf http://localhost:8080/health/live >/dev/null 2>&1 && break
+            sleep 1
+          done
+          NAMESPACE="$NAMESPACE" bash scripts/smoke-test.sh
+
+      - name: Run functional E2E against preview (via port-forward 8080:80)
+        env:
+          WIKI_URL: http://localhost:8080
+        run: bash tests/e2e/run.sh
 
   # ── Stage 3: switch traffic (BLUE → GREEN) ────────────────────────────────
   switch-traffic:
     name: Promote GREEN to live
     needs: smoke-test
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -137,21 +146,27 @@ jobs:
 
       - name: Switch service selector to slot=green
         run: |
-          kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} patch svc wiki -p '{"spec":{"selector":{"app.kubernetes.io/name":"wiki","app.kubernetes.io/slot":"green"}}}'
-          # Wait for endpoints to refresh
+          kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} patch svc wiki \
+            -p '{"spec":{"selector":{"app.kubernetes.io/name":"wiki","app.kubernetes.io/slot":"green"}}}'
           sleep 3
           kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} get endpoints wiki -o yaml
 
-      - name: Verify live traffic
+      - name: Verify live traffic via explicit URL
+        env:
+          WIKI_URL: ${{ env.WIKI_URL }}
         run: |
-          kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} port-forward svc/wiki 8081:3000 &
-          sleep 5
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8081/health)
-          if [ "$STATUS" != "200" ]; then
-            echo "::error::Live health check failed: $STATUS"
-            exit 1
-          fi
-          echo "Live traffic verified: 200 OK"
+          echo "Checking live URL: $WIKI_URL"
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$WIKI_URL/health/live" || echo 000)
+            if [ "$STATUS" = "200" ]; then
+              echo "✓ Live traffic verified: 200 OK at $WIKI_URL"
+              exit 0
+            fi
+            echo "Attempt $i: status=$STATUS, retrying in 3s..."
+            sleep 3
+          done
+          echo "::error::Live health check failed after 10 attempts: $WIKI_URL/health/live"
+          exit 1
 
       - name: Notify — promoted
         if: env.SLACK_WEBHOOK_URL != ''
@@ -160,7 +175,7 @@ jobs:
         run: |
           bash scripts/notify.sh \
             ":tada: Promoted to ${{ inputs.environment }}" \
-            "wiki-v2:${{ inputs.image_tag }}" \
+            "wiki:${{ inputs.image_tag }}  URL=${{ env.WIKI_URL }}" \
             "${{ github.sha }}" \
             "#36a64f"
 
@@ -168,21 +183,19 @@ jobs:
   scale-down-blue:
     name: Scale down BLUE
     needs: switch-traffic
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Annotate previous blue revision (for rollback)
+      - name: Annotate + scale down previous blue revision (keep 1 for rollback)
         run: |
-          # Find existing blue deployment (the previous live slot)
-          BLUE=$(kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} get deploy -l app.kubernetes.io/slot=blue -o name || true)
+          BLUE=$(kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} get deploy -l app.kubernetes.io/slot=blue -o name 2>/dev/null || true)
           if [ -n "$BLUE" ]; then
             kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} annotate --overwrite deploy/wiki-blue \
               wiki.rollwar.io/last-live-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
               wiki.rollwar.io/image-tag="${{ inputs.image_tag }}"
-            # Keep 1 replica warm for fast rollback — scale down but don't delete
             kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} scale deploy/wiki-blue --replicas=1
             echo "BLUE scaled to 1 (kept for rollback)"
           else
@@ -191,34 +204,36 @@ jobs:
 
       - name: Tag current green as blue (for next cycle)
         run: |
-          # Rename: the new green becomes the new blue on the next deploy
-          # We achieve this by patching labels via a state annotation
           kubectl --context k8s -n ${{ env.KUBE_NAMESPACE }} annotate --overwrite deploy/wiki-green \
             wiki.rollwar.io/promoted-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  # ── Stage 5: post-deploy health monitor (auto-rollback) ──────────────────
+  # ── Stage 5: post-deploy health monitor (auto-rollback on failure) ────────
   post-deploy-monitor:
     name: Post-deploy monitor (auto-rollback on failure)
     needs: [switch-traffic, scale-down-blue]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Monitor health for 2 minutes — auto-rollback if degraded
+      - name: Monitor live URL for 2 minutes — auto-rollback if degraded
         env:
+          WIKI_URL: ${{ env.WIKI_URL }}
           NAMESPACE: ${{ env.KUBE_NAMESPACE }}
           ROLLBACK_WORKFLOW: rollback.yml
         run: bash scripts/post-deploy-monitor.sh
 
-  # ── Final: notify ─────────────────────────────────────────────────────────
+  # ── Final: notify on failure ───────────────────────────────────────────────
   notify-failure:
     name: Notify failure (auto-rollback triggered)
     needs: [deploy-green, smoke-test, switch-traffic, post-deploy-monitor]
     if: failure()
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Notify Slack
         if: env.SLACK_WEBHOOK_URL != ''
         env:
@@ -226,6 +241,6 @@ jobs:
         run: |
           bash scripts/notify.sh \
             ":rotating_light: CD FAILED — rollback triggered" \
-            "wiki-v2:${{ inputs.image_tag }}" \
+            "wiki:${{ inputs.image_tag }}  URL=${{ env.WIKI_URL }}" \
             "${{ github.sha }}" \
             "#dc3545"
