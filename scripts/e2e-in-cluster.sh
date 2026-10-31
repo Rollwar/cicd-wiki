@@ -38,41 +38,71 @@ echo "[e2e-in-cluster] namespace=$NAMESPACE  service=$SERVICE"
 echo "[e2e-in-cluster] WIKI_URL=$WIKI_URL"
 echo "[e2e-in-cluster] pod=$POD_NAME"
 
-# Используем образ с curl + jq. Альпиний легкий (5MB), jq добавляем через apk.
-# curlimages/curl НЕ имеет jq, поэтому берём alpine + ставим curl jq.
-IMAGE="alpine:3.20"
+# Используем образ с ПРЕДУСТАНОВЛЕННЫМИ curl + jq + bash.
+# Раньше брали alpine:3.20 и делали apk add — но это требует root
+# (apk пишет в /var/cache/apk), а мы запускаем pod от runAsUser=1000 (baseline).
+# Поэтому берём готовый образ, где всё уже есть.
+IMAGE="alpine/k8s:1.31.1"
 
 # 1. Создать pod с alpine, установить curl и jq
-# ВАЖНО: аннотация sidecar.istio.io/inject=false — отключает Istio sidecar injection
-# для этого временного pod'а. Без неё в namespace с istio-injection=enabled
-# к pod'у добавляется istio-init container, требующий NET_ADMIN/NET_RAW capabilities,
-# что запрещено PodSecurity baseline.
+# ВАЖНО: используем kubectl apply -f вместо kubectl run, потому что
+# kubectl run применяет --overrides ПОСЛЕ mutating webhook'ов, поэтому
+# Istio webhook не видит аннотацию sidecar.istio.io/inject=false и всё равно
+# добавляет istio-init (который требует NET_ADMIN/NET_RAW capabilities,
+# запрещённые PodSecurity baseline).
+#
+# Через kubectl apply -f аннотация попадает в манифест ДО webhook'ов,
+# и Istio корректно пропускает этот pod.
 echo "[e2e-in-cluster] creating debug pod $POD_NAME (istio sidecar disabled)..."
-kubectl --context k8s -n "$NAMESPACE" run "$POD_NAME" \
-  --image="$IMAGE" \
-  --restart=Never \
-  --command -- sleep 600 \
-  --limits=cpu=200m,memory=128Mi \
-  --overrides='{
-    "metadata": {
-      "labels": {
-        "app.kubernetes.io/name": "e2e-test",
-        "app.kubernetes.io/managed-by": "ci-pipeline"
-      },
-      "annotations": {
-        "sidecar.istio.io/inject": "false"
-      }
-    }
-  }'
+cat <<POD_MANIFEST | kubectl --context k8s -n "$NAMESPACE" apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $POD_NAME
+  namespace: $NAMESPACE
+  labels:
+    app.kubernetes.io/name: e2e-test
+    app.kubernetes.io/managed-by: ci-pipeline
+  annotations:
+    # Явно отключаем Istio sidecar injection.
+    # Без этой аннотации (при namespace с istio-injection=enabled)
+    # к pod'у добавляется istio-init container, требующий NET_ADMIN/NET_RAW.
+    sidecar.istio.io/inject: "false"
+spec:
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: tester
+      image: $IMAGE
+      command: ["sleep", "600"]
+      resources:
+        limits:
+          cpu: 200m
+          memory: 128Mi
+        requests:
+          cpu: 50m
+          memory: 64Mi
+      securityContext:
+        # runAsUser: 0 — это РАЗРЕШЕНО PodSecurity baseline.
+        # alpine/k8s образ запускается от root (нужно для kubectl, helm, jq),
+        # поэтому не ставим runAsNonRoot: true (это противоречило бы).
+        # Baseline запрещает только capabilities (NET_ADMIN, NET_RAW),
+        # но не запрещает запуск от root.
+        runAsUser: 0
+        runAsNonRoot: false
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+POD_MANIFEST
 
 # Ждём, пока pod станет Ready
 echo "[e2e-in-cluster] waiting for pod to be Ready..."
 kubectl --context k8s -n "$NAMESPACE" wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s
 
-# Установить curl и jq
-echo "[e2e-in-cluster] installing curl + jq in pod ..."
+# Проверяем, что нужные инструменты есть
+echo "[e2e-in-cluster] verifying curl + jq + bash in pod ..."
 kubectl --context k8s -n "$NAMESPACE" exec "$POD_NAME" -- \
-  sh -c 'apk add --no-cache curl jq bash 2>&1 | tail -1'
+  sh -c 'command -v curl && command -v jq && command -v bash && echo OK || { echo "missing tools"; exit 1; }'
 
 # 2. Копировать тестовый скрипт в pod
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
