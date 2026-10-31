@@ -114,25 +114,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run smoke tests via preview service (port-forward 8080:80)
+      - name: Run smoke tests via in-cluster debug pod (against wiki-preview)
         env:
           NAMESPACE: ${{ env.KUBE_NAMESPACE }}
         run: |
-          # GREEN slot доступен через svc/wiki-preview в namespace.
-          # Port-forward с runner'а (kubectl context k8s уже настроен).
-          kubectl --context k8s -n "$NAMESPACE" port-forward svc/wiki-preview 8080:80 >/tmp/smoke-pf.log 2>&1 &
-          PF=$!
-          trap "kill $PF 2>/dev/null || true" EXIT
-          for i in {1..15}; do
-            curl -sf http://localhost:8080/health/live >/dev/null 2>&1 && break
-            sleep 1
-          done
-          NAMESPACE="$NAMESPACE" bash scripts/smoke-test.sh
+          # GREEN slot доступен через cluster DNS:
+          #   wiki-preview.<namespace>.svc.cluster.local
+          # Запускаем smoke + E2E ИЗНУТРИ кластера — через временный debug-pod.
+          # Это даёт реальный сетевой путь (как у других приложений в кластере),
+          # и не требует port-forward на localhost (который недоступен извне runner'а).
+          bash scripts/e2e-in-cluster.sh "$NAMESPACE" wiki-preview /tmp/e2e-prepromote
 
-      - name: Run functional E2E against preview (via port-forward 8080:80)
-        env:
-          WIKI_URL: http://localhost:8080
-        run: bash tests/e2e/run.sh
+      - name: Upload pre-promote E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-prepromote-report-${{ inputs.environment }}
+          path: /tmp/e2e-prepromote/
+          retention-days: 14
+          if-no-files-found: ignore
 
   # ── Stage 3: switch traffic (BLUE → GREEN) ────────────────────────────────
   switch-traffic:
@@ -167,6 +167,27 @@ jobs:
           done
           echo "::error::Live health check failed after 10 attempts: $WIKI_URL/health/live"
           exit 1
+
+      - name: Run post-promote E2E against live service (in-cluster)
+        env:
+          NAMESPACE: ${{ env.KUBE_NAMESPACE }}
+        run: |
+          # После переключения Service wiki указывает на slot=GREEN.
+          # Тестируем через cluster DNS: wiki.<namespace>.svc.cluster.local
+          # (это внутренний путь приложения в кластере).
+          # Параллельно уже запущен Verify live traffic via explicit URL (через bastion).
+          echo "─── Post-promote E2E on live service (in-cluster) ───"
+          echo "Testing: http://wiki.${NAMESPACE}.svc.cluster.local"
+          bash scripts/e2e-in-cluster.sh "$NAMESPACE" wiki /tmp/e2e-postpromote
+
+      - name: Upload post-promote E2E report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-postpromote-report-${{ inputs.environment }}
+          path: /tmp/e2e-postpromote/
+          retention-days: 14
+          if-no-files-found: ignore
 
       - name: Notify — promoted
         if: env.SLACK_WEBHOOK_URL != ''
