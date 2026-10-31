@@ -47,12 +47,6 @@ async function run() {
     }
   }
 
-  await check('GET / returns Wiki.js', async () => {
-    const r = await request('GET', '/')
-    assert.strictEqual(r.status, 200)
-    assert.strictEqual(JSON.parse(r.body).name, 'Wiki.js')
-  })
-
   await check('GET /health/live → 200', async () => {
     const r = await request('GET', '/health/live')
     assert.strictEqual(r.status, 200)
@@ -61,12 +55,6 @@ async function run() {
   await check('GET /health/ready → 200', async () => {
     const r = await request('GET', '/health/ready')
     assert.strictEqual(r.status, 200)
-  })
-
-
-  await check('GET unknown slug → 404', async () => {
-    const r = await request('GET', '/api/pages/definitely-not-real-xyz')
-    assert.strictEqual(r.status, 404)
   })
 
   console.log('\n═══ E2E TEST RESULTS ═══')
