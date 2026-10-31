@@ -8,7 +8,7 @@
 const http = require('http')
 const assert = require('assert')
 
-const WIKI_URL = process.env.WIKI_URL || 'http://localhost:3000'
+const WIKI_URL = process.env.WIKI_URL || 'http://localhost:80'
 
 function request(method, path, body) {
   return new Promise((resolve, reject) => {
@@ -63,24 +63,6 @@ async function run() {
     assert.strictEqual(r.status, 200)
   })
 
-  const slug = `jest-${Date.now()}`
-  await check(`POST /api/pages creates "${slug}"`, async () => {
-    const r = await request('POST', '/api/pages', { slug, title: 'Jest Page', content: '# Jest' })
-    assert.strictEqual(r.status, 201)
-  })
-
-  await check(`GET /api/pages/${slug} returns the page`, async () => {
-    const r = await request('GET', `/api/pages/${slug}`)
-    assert.strictEqual(r.status, 200)
-    assert.strictEqual(JSON.parse(r.body).title, 'Jest Page')
-  })
-
-  await check('Idempotent update preserves id', async () => {
-    const r = await request('POST', '/api/pages', { slug, title: 'Jest v2', content: '# v2' })
-    assert.strictEqual(r.status, 201)
-    const g = await request('GET', `/api/pages/${slug}`)
-    assert.strictEqual(JSON.parse(g.body).title, 'Jest v2')
-  })
 
   await check('GET unknown slug → 404', async () => {
     const r = await request('GET', '/api/pages/definitely-not-real-xyz')

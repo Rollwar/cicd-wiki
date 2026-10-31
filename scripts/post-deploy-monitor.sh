@@ -10,7 +10,7 @@ ROLLBACK_WORKFLOW="${ROLLBACK_WORKFLOW:-rollback.yml}"
 
 echo "[monitor] watching namespace=$NAMESPACE for ${MONITOR_MINUTES}m, threshold=$FAILURE_THRESHOLD"
 
-kubectl --context k8s -n "$NAMESPACE" port-forward svc/wiki 8090:3000 >/tmp/monitor-pf.log 2>&1 &
+kubectl --context k8s -n "$NAMESPACE" port-forward svc/wiki 8090:80 >/tmp/monitor-pf.log 2>&1 &
 PF_PID=$!
 trap "kill $PF_PID 2>/dev/null || true" EXIT
 

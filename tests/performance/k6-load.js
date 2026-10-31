@@ -1,12 +1,12 @@
 /**
  * tests/performance/k6-load.js — k6 load test for wiki.js.
- * Run: k6 run --env TARGET_URL=http://wiki.production.svc.cluster.local:3000 k6-load.js
+ * Run: k6 run --env TARGET_URL=http://wiki.production.svc.cluster.local k6-load.js
  */
 import http from 'k6/http'
 import { check, sleep, group } from 'k6'
 import { Rate, Trend } from 'k6/metrics'
 
-const TARGET = __ENV.TARGET_URL || 'http://localhost:3000'
+const TARGET = __ENV.TARGET_URL || 'http://localhost:80'
 const DURATION = __ENV.DURATION || '60s'
 const VUS = parseInt(__ENV.VUS || '50', 10)
 
