@@ -58,8 +58,15 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1001
-        fsGroup: 1001
+        # UID 1000 = node user в requarks/wiki-v2 Dockerfile.
+        # РАНЬШЕ было 1001 — это приводило к EACCES на /wiki/data/cache,
+        # потому что Dockerfile создаёт папки от root и chown'ит только под user node (1000).
+        runAsUser: 1000
+        fsGroup: 1000
+        # fsGroupChangePolicy: OnRootMismatch — K8s chown'ит volume'ы под fsGroup
+        # автоматически при создании pod'а. НЕ нужен initContainer, НЕ нужен root,
+        # НЕ нужны capabilities (CHOWN). Это работает под PodSecurity baseline.
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: wiki
           image: __IMAGE__
@@ -73,8 +80,15 @@ spec:
             - secretRef:
                 name: wiki-secret
           volumeMounts:
+            # /wiki/data — основная директория данных wiki.js (cache, content, repo)
+            - name: wiki-data
+              mountPath: /wiki/data
+            # /wiki/data/uploads — пользовательские файлы (preserve между restart)
             - name: uploads
-              mountPath: /app/data/uploads
+              mountPath: /wiki/data/uploads
+            # /logs — логи wiki.js (если пишет в файлы, не только в stdout)
+            - name: wiki-logs
+              mountPath: /logs
           readinessProbe:
             httpGet:
               path: /health/ready
@@ -102,9 +116,19 @@ spec:
             capabilities:
               drop: [ALL]
       volumes:
+        # /wiki/data — emptyDir, чтобы K8s создал директорию с правами fsGroup.
+        # Внутри будут cache/, content/, repo/ (создаются wiki.js при старте).
+        # Кэш можно терять при restart pod'а — это нормально.
+        - name: wiki-data
+          emptyDir: {}
+        # /wiki/data/uploads — пользовательские файлы (сохраняются между restart).
         - name: uploads
           persistentVolumeClaim:
             claimName: wiki-uploads-pvc
+        # /logs — emptyDir, потому что wiki.js пишет логи в основном в stdout,
+        # но некоторые модули могут писать в файлы.
+        - name: wiki-logs
+          emptyDir: {}
       # imagePullSecrets нужен, если GHCR-пакет приватный.
       # Для публичного пакета можно удалить.
       # imagePullSecrets:

@@ -8,7 +8,7 @@ NAMESPACE="${NAMESPACE:?NAMESPACE must be set}"
 echo "[smoke] namespace=$NAMESPACE"
 
 # Use kubectl port-forward to reach the preview service
-kubectl -n "$NAMESPACE" port-forward svc/wiki-preview 8080:3000 >/tmp/smoke-pf.log 2>&1 &
+kubectl --context k8s -n "$NAMESPACE" port-forward svc/wiki-preview 8080:3000 >/tmp/smoke-pf.log 2>&1 &
 PF_PID=$!
 trap "kill $PF_PID 2>/dev/null || true" EXIT
 

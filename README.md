@@ -1,7 +1,7 @@
 # cicd-wikijs — CI/CD для Wiki.js на GitHub Actions
 
 > Полноценный конвейер Continuous Integration / Continuous Delivery для приложения
-> [Wiki.js v2](https://github.com/Rollwar/wiki), построенный на **GitHub Actions** и
+> [Wiki.js v2](https://github.com/Rollwar/wiki-v2), построенный на **GitHub Actions** и
 > ориентированный на развёртывание в **k3s** (легковесный Kubernetes) по стратегии
 > **blue-green** (бесшовный deploy с мгновенным откатом).
 
@@ -33,7 +33,7 @@
 Этот репозиторий содержит **пайплайн CI/CD** (workflow-файлы GitHub Actions, манифесты
 Kubernetes, скрипты развертывания, функциональные и нагрузочные тесты) для приложения
 Wiki.js. Само приложение живёт в отдельном репозитории
-[`Rollwar/wiki-v2`](https://github.com/Rollwar/wiki) и вызывает переиспользуемые
+[`Rollwar/wiki-v2`](https://github.com/Rollwar/wiki-v2) и вызывает переиспользуемые
 workflow отсюда через `workflow_call`.
 
 ### Что покрывает пайплайн
@@ -462,3 +462,24 @@ cicd-wikijs/
 | `CICD_PAT`           | GitHub PAT для cross-repo `workflow_dispatch`      | `ghp_...` (repo:workflow scope)              |
 
 `GITHUB_TOKEN` автоматически предоставляется GitHub Actions — используется для пуша в GHCR (packages: write).
+
+---
+
+## Расширение и доработка
+
+Идеи для развития:
+
+- **Подпись образов через cosign + policy controller** в кластере (Gatekeeper / Kyverno).
+- **Sealed Secrets** или **external-secrets-operator** вместо plaintext Secret в манифесте.
+- **Helm chart** вместо raw YAML (упростит multitenancy).
+- **Prometheus + Grafana** + ServiceMonitor для сбора метрик wiki.js в реальном времени.
+- **Trivy image scan** после build-стейджа (block deploy при CRITICAL).
+- **Canary deployment** через Argo Rollouts / Flagger как следующая ступень после blue-green.
+- **Multi-arch образы** (amd64 + arm64) через `docker/build-push-action` platforms.
+
+---
+
+## Лицензия и авторство
+
+Демонстрационный проект. Wiki.js © Requarks и соавторы, используется по лицензии AGPL-3.0.
+CI/CD код в этом репозитории — MIT.

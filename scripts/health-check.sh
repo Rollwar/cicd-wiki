@@ -2,7 +2,7 @@
 # scripts/health-check.sh — quick verification of wiki endpoints.
 set -euo pipefail
 
-URL="${1:-http://localhost:3000}"
+URL="${1:-http://localhost:80}"
 
 check() {
   local name="$1" expected="$2" actual="$3"
